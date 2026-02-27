@@ -30,6 +30,15 @@ trait ParallelSafeStreamingCommandRouter extends Module {
   val FUNCT_SRC_INFO         = 1.U
   val FUNCT_DEST_INFO        = 2.U
   val FUNCT_CHECK_COMPLETION = 3.U
+  val FUNCT_READ_MONITOR     = 4.U
+
+  val DMA_MON_VALID               = 0.U(64.W)
+  val DMA_MON_SRC_CMDS            = 1.U(64.W)
+  val DMA_MON_DST_CMDS            = 2.U(64.W)
+  val DMA_MON_REQ_COPY_BYTES      = 3.U(64.W)
+  val DMA_MON_CYCLES              = 4.U(64.W)
+  val DMA_MON_EFFECTIVE_BYTES     = 5.U(64.W)
+  val DMA_MON_EFF_BW_X1000_BPC    = 6.U(64.W)
 
   val cur_funct = io.rocc_in.bits.inst.funct
   val cur_rs1 = io.rocc_in.bits.rs1
@@ -69,11 +78,45 @@ trait ParallelSafeStreamingCommandRouter extends Module {
   val track_dispatched_src_infos = RegInit(0.U(64.W))
   val bufs_completed_base = RegInit(0.U(64.W))
 
+  val monitor_active = RegInit(false.B)
+  val monitor_cycle = RegInit(0.U(64.W))
+  val monitor_start_cycle = RegInit(0.U(64.W))
+  val monitor_src_cmds = RegInit(0.U(64.W))
+  val monitor_dst_cmds = RegInit(0.U(64.W))
+  val monitor_req_copy_bytes = RegInit(0.U(64.W))
+  val monitor_bus_bytes_base = RegInit(0.U(64.W))
+
+  val monitor_last_valid = RegInit(false.B)
+  val monitor_last_src_cmds = RegInit(0.U(64.W))
+  val monitor_last_dst_cmds = RegInit(0.U(64.W))
+  val monitor_last_req_copy_bytes = RegInit(0.U(64.W))
+  val monitor_last_cycles = RegInit(0.U(64.W))
+  val monitor_last_effective_bytes = RegInit(0.U(64.W))
+
+  monitor_cycle := monitor_cycle + 1.U
+
   when(io.rocc_in.fire && cur_funct === FUNCT_SRC_INFO) {
+    when(!monitor_active) {
+      monitor_active := true.B
+      monitor_start_cycle := monitor_cycle
+      monitor_src_cmds := 0.U
+      monitor_dst_cmds := 0.U
+      monitor_req_copy_bytes := 0.U
+      monitor_bus_bytes_base := io.bus_write_bytes
+      monitor_last_valid := false.B
+    }
+
+    monitor_src_cmds := monitor_src_cmds + 1.U
+    monitor_req_copy_bytes := monitor_req_copy_bytes + cur_rs2
+
     when(track_dispatched_src_infos === 0.U) {
       bufs_completed_base := io.bufs_completed
     }
     track_dispatched_src_infos := track_dispatched_src_infos + 1.U
+  }
+
+  when(io.rocc_in.fire && cur_funct === FUNCT_DEST_INFO) {
+    monitor_dst_cmds := monitor_dst_cmds + 1.U
   }
 
   val completed_since_base = io.bufs_completed - bufs_completed_base
@@ -89,18 +132,54 @@ trait ParallelSafeStreamingCommandRouter extends Module {
   )
 
   when(io.rocc_in.fire && cur_funct === FUNCT_CHECK_COMPLETION) {
+    val monitor_cycles_this = monitor_cycle - monitor_start_cycle
+    val monitor_bus_bytes_this = io.bus_write_bytes - monitor_bus_bytes_base
+    monitor_last_valid := monitor_active
+    monitor_last_src_cmds := monitor_src_cmds
+    monitor_last_dst_cmds := monitor_dst_cmds
+    monitor_last_req_copy_bytes := monitor_req_copy_bytes
+    monitor_last_cycles := Mux(monitor_active && monitor_cycles_this === 0.U, 1.U, monitor_cycles_this)
+    monitor_last_effective_bytes := monitor_bus_bytes_this
+    monitor_active := false.B
+
     track_dispatched_src_infos := 0.U
     bufs_completed_base := io.bufs_completed
   }
 
-  io.rocc_out.valid := check_completion_fire.fire(io.rocc_out.ready)
-  io.rocc_out.bits.data := track_dispatched_src_infos
+  val monitor_data = Wire(UInt(64.W))
+  monitor_data := 0.U
+  when (cur_rs1 === DMA_MON_VALID) {
+    monitor_data := monitor_last_valid
+  } .elsewhen (cur_rs1 === DMA_MON_SRC_CMDS) {
+    monitor_data := monitor_last_src_cmds
+  } .elsewhen (cur_rs1 === DMA_MON_DST_CMDS) {
+    monitor_data := monitor_last_dst_cmds
+  } .elsewhen (cur_rs1 === DMA_MON_REQ_COPY_BYTES) {
+    monitor_data := monitor_last_req_copy_bytes
+  } .elsewhen (cur_rs1 === DMA_MON_CYCLES) {
+    monitor_data := monitor_last_cycles
+  } .elsewhen (cur_rs1 === DMA_MON_EFFECTIVE_BYTES) {
+    monitor_data := monitor_last_effective_bytes
+  } .elsewhen (cur_rs1 === DMA_MON_EFF_BW_X1000_BPC) {
+    monitor_data := 0.U
+  }
+
+  val read_monitor_fire = DecoupledHelper(
+    io.rocc_in.valid,
+    cur_funct === FUNCT_READ_MONITOR,
+    io.rocc_out.ready
+  )
+
+  io.rocc_out.valid := check_completion_fire.fire(io.rocc_out.ready) ||
+    read_monitor_fire.fire(io.rocc_out.ready)
+  io.rocc_out.bits.data := Mux(read_monitor_fire.fire(io.rocc_out.ready), monitor_data, track_dispatched_src_infos)
   io.rocc_out.bits.rd := io.rocc_in.bits.inst.rd
 
   val streaming_fire = sfence_fire.fire(io.rocc_in.valid) ||
     src_info_fire.fire(io.rocc_in.valid) ||
     dest_info_fire.fire(io.rocc_in.valid) ||
-    check_completion_fire.fire(io.rocc_in.valid)
+    check_completion_fire.fire(io.rocc_in.valid) ||
+    read_monitor_fire.fire(io.rocc_in.valid)
 }
 
 class GemminiDirectDMANew(opcodes: OpcodeSet)(implicit p: Parameters)
@@ -201,4 +280,5 @@ class GemminiDirectDMANewImp(outer: GemminiDirectDMANew)(implicit p: Parameters)
   memwriter.io.decompress_dest_info <> cmd_router.io.dest_info
   cmd_router.io.bufs_completed := memwriter.io.bufs_completed
   cmd_router.io.no_writes_inflight := memwriter.io.no_writes_inflight
+  cmd_router.io.bus_write_bytes := memwriter.io.bus_write_bytes
 }
