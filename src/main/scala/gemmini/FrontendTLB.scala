@@ -97,7 +97,31 @@ class FrontendTLB(nClients: Int, entries: Int, maxSize: Int, use_tlb_register_fi
     val ptw = Vec(num_tlbs, new TLBPTWIO)
     val exp = Vec(num_tlbs, new TLBExceptionIO)
     val counter = new CounterEventIO()
+
+    // Shared-spad translation control (dual path: DRAM TLB + shared-spad direct translation).
+    val spm_xlate_enable = Input(Bool())
+    val spm_xlate_page_shift = Input(UInt(8.W))
+    val spm_xlate_pte_count = Input(UInt(16.W))
+    val spm_xlate_range_base = Input(UInt(vaddrBits.W))
+    val spm_xlate_range_size = Input(UInt(vaddrBits.W))
+    val spm_xlate_shared_base = Input(UInt(paddrBits.W))
+    val spm_fault_clear = Input(Bool())
+    val spm_fault_valid = Output(Bool())
+    val spm_fault_vaddr = Output(UInt(vaddrBits.W))
+    val spm_fault_cause = Output(UInt(8.W))
   })
+
+  val spm_fault_valid = RegInit(false.B)
+  val spm_fault_vaddr = RegInit(0.U(vaddrBits.W))
+  val spm_fault_cause = RegInit(0.U(8.W))
+  io.spm_fault_valid := spm_fault_valid
+  io.spm_fault_vaddr := spm_fault_vaddr
+  io.spm_fault_cause := spm_fault_cause
+  when (io.spm_fault_clear) {
+    spm_fault_valid := false.B
+    spm_fault_vaddr := 0.U
+    spm_fault_cause := 0.U
+  }
 
   val tlbs = Seq.fill(num_tlbs)(Module(new DecoupledTLB(entries, maxSize, use_firesim_simulation_counters)))
 
@@ -119,18 +143,35 @@ class FrontendTLB(nClients: Int, entries: Int, maxSize: Int, use_tlb_register_fi
     val last_translated_vpn = RegInit(0.U(vaddrBits.W))
     val last_translated_ppn = RegInit(0.U(paddrBits.W))
 
-    val l0_tlb_hit = last_translated_valid && ((client.req.bits.tlb_req.vaddr >> pgIdxBits).asUInt === (last_translated_vpn >> pgIdxBits).asUInt)
-    val l0_tlb_paddr = Cat(last_translated_ppn >> pgIdxBits, client.req.bits.tlb_req.vaddr(pgIdxBits-1,0))
+    val req_vaddr = client.req.bits.tlb_req.vaddr
+    val spm_range_end = io.spm_xlate_range_base + io.spm_xlate_range_size
+    val spm_in_range = io.spm_xlate_enable && (io.spm_xlate_range_size =/= 0.U) &&
+      req_vaddr >= io.spm_xlate_range_base && req_vaddr < spm_range_end
+    val spm_page_shift = Mux(io.spm_xlate_page_shift < pgIdxBits.U, pgIdxBits.U, io.spm_xlate_page_shift)
+    val spm_offset = req_vaddr - io.spm_xlate_range_base
+    val spm_vpn = spm_offset >> spm_page_shift
+    val spm_pte_ok = spm_vpn < io.spm_xlate_pte_count
+    val spm_hit = spm_in_range && spm_pte_ok
+    val spm_paddr = io.spm_xlate_shared_base + spm_offset
+
+    val l0_tlb_hit = (last_translated_valid &&
+      ((req_vaddr >> pgIdxBits).asUInt === (last_translated_vpn >> pgIdxBits).asUInt)) || spm_hit
+    val cached_l0_paddr = Cat(last_translated_ppn >> pgIdxBits, req_vaddr(pgIdxBits-1,0))
+    val l0_tlb_paddr = Mux(spm_hit, spm_paddr, cached_l0_paddr)
 
     val tlb = if (use_shared_tlb) tlbs.head else tlbs(i)
     val tlbReq = if (use_shared_tlb) tlbArbOpt.get.io.in(i).bits else tlb.io.req.bits
     val tlbReqValid = if (use_shared_tlb) tlbArbOpt.get.io.in(i).valid else tlb.io.req.valid
     val tlbReqFire = if (use_shared_tlb) tlbArbOpt.get.io.in(i).fire else tlb.io.req.fire
 
-    tlbReqValid := RegNext(client.req.valid && !l0_tlb_hit)
+    tlbReqValid := RegNext(client.req.valid && !l0_tlb_hit && !spm_in_range)
     tlbReq := RegNext(client.req.bits)
 
-    when (tlbReqFire && !tlb.io.resp.miss) {
+    when (client.req.valid && spm_hit) {
+      last_translated_valid := true.B
+      last_translated_vpn := req_vaddr
+      last_translated_ppn := spm_paddr
+    }.elsewhen (tlbReqFire && !tlb.io.resp.miss) {
       last_translated_valid := true.B
       last_translated_vpn := tlbReq.tlb_req.vaddr
       last_translated_ppn := tlb.io.resp.paddr
@@ -138,6 +179,12 @@ class FrontendTLB(nClients: Int, entries: Int, maxSize: Int, use_tlb_register_fi
 
     when (tlb.io.exp.flush()) {
       last_translated_valid := false.B
+    }
+
+    when (client.req.valid && spm_in_range && !spm_pte_ok && !spm_fault_valid) {
+      spm_fault_valid := true.B
+      spm_fault_vaddr := req_vaddr
+      spm_fault_cause := 2.U // invalid shared-spad pte index
     }
 
     when (tlbReqFire) {

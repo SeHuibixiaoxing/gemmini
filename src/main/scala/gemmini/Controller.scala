@@ -51,7 +51,12 @@ class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](val config: GemminiA
   } else {
     // If using shared scratchpad.
     val sharedSpad = LazyModule(new SharedScratchpad(config))
-    sharedSpad.global_node := slaveNode
+    CoupledSharedSpadRegistry
+      .registerLocalNode(config.gemmini_id, client => sharedSpad.local_node := client)
+      .foreach { client =>
+        sharedSpad.local_node := client
+      }
+    sharedSpad.global_node := TLBuffer() := slaveNode
 
     val xbar = TLXbar()
     xbar := spad.id_node
@@ -81,17 +86,51 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
   // Counters
   val counters = Module(new CounterController(outer.config.num_counter, outer.xLen))
-  io.resp <> counters.io.out  // Counter access command will be committed immediately
   counters.io.event_io.external_values(0) := 0.U
   counters.io.event_io.event_signal(0) := false.B
   counters.io.in.valid := false.B
   counters.io.in.bits := DontCare
   counters.io.event_io.collect(spad.module.io.counter)
 
+  val spm_xlate_resp = Wire(Decoupled(new RoCCResponse))
+  spm_xlate_resp.valid := false.B
+  spm_xlate_resp.bits.rd := 0.U
+  spm_xlate_resp.bits.data := 0.U
+
+  val resp_arb = Module(new Arbiter(new RoCCResponse, 2))
+  resp_arb.io.in(0) <> counters.io.out
+  resp_arb.io.in(1) <> spm_xlate_resp
+  io.resp <> resp_arb.io.out
+
   // TLB
   implicit val edge = outer.spad.id_node.edges.out.head
   val tlb = Module(new FrontendTLB(2, tlb_size, dma_maxbytes, use_tlb_register_filter, use_firesim_simulation_counters, use_shared_tlb))
   (tlb.io.clients zip outer.spad.module.io.tlb).foreach(t => t._1 <> t._2)
+
+  // Shared-spad translation controls are programmed by dedicated Gemmini funct commands.
+  val spm_xlate_enable = RegInit(false.B)
+  val spm_xlate_page_shift = RegInit(10.U(8.W))
+  val spm_xlate_pte_count = RegInit(0.U(16.W))
+  val spm_xlate_ptbr = RegInit(0.U(xLen.W))
+  val spm_xlate_range_base = RegInit(0.U(xLen.W))
+  val spm_xlate_range_size = RegInit(0.U(xLen.W))
+  val spm_xlate_fault_vaddr = RegInit(0.U(xLen.W))
+  val spm_xlate_fault_cause = RegInit(0.U(8.W))
+  val spm_xlate_fault_valid = RegInit(false.B)
+
+  tlb.io.spm_xlate_enable := spm_xlate_enable
+  tlb.io.spm_xlate_page_shift := spm_xlate_page_shift
+  tlb.io.spm_xlate_pte_count := spm_xlate_pte_count
+  tlb.io.spm_xlate_range_base := spm_xlate_range_base
+  tlb.io.spm_xlate_range_size := spm_xlate_range_size
+  tlb.io.spm_xlate_shared_base := outer.config.shared_scratchpad_config.global_base_addr.U(paddrBits.W)
+  tlb.io.spm_fault_clear := false.B
+
+  when (tlb.io.spm_fault_valid) {
+    spm_xlate_fault_valid := true.B
+    spm_xlate_fault_vaddr := tlb.io.spm_fault_vaddr
+    spm_xlate_fault_cause := tlb.io.spm_fault_cause
+  }
 
   tlb.io.exp.foreach(_.flush_skip := false.B)
   tlb.io.exp.foreach(_.flush_retry := false.B)
@@ -388,6 +427,10 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
     val is_flush = risc_funct === FLUSH_CMD
     val is_counter_op = risc_funct === COUNTER_OP
     val is_clock_gate_en = risc_funct === CLKGATE_EN
+    val is_spm_xlate_cfg = risc_funct === SPM_XLATE_CFG
+    val is_spm_xlate_range = risc_funct === SPM_XLATE_RANGE
+    val is_spm_xlate_flush = risc_funct === SPM_XLATE_FLUSH
+    val is_spm_xlate_fault = risc_funct === SPM_XLATE_FAULT
 
     /*
     val is_load = (funct === LOAD_CMD) || (funct === CONFIG_CMD && config_cmd_type === CONFIG_LOAD)
@@ -413,6 +456,43 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
 
     .elsewhen (is_clock_gate_en) {
       unrolled_cmd.ready := true.B
+    }
+
+    .elsewhen (is_spm_xlate_cfg) {
+      val rs2 = unrolled_cmd.bits.cmd.rs2
+      unrolled_cmd.ready := true.B
+      when (unrolled_cmd.fire) {
+        spm_xlate_ptbr := unrolled_cmd.bits.cmd.rs1
+        spm_xlate_pte_count := rs2(31, 16)
+        spm_xlate_page_shift := rs2(15, 8)
+        spm_xlate_enable := rs2(0)
+        spm_xlate_fault_valid := false.B
+      }
+    }
+
+    .elsewhen (is_spm_xlate_range) {
+      unrolled_cmd.ready := true.B
+      when (unrolled_cmd.fire) {
+        spm_xlate_range_base := unrolled_cmd.bits.cmd.rs1
+        spm_xlate_range_size := unrolled_cmd.bits.cmd.rs2
+      }
+    }
+
+    .elsewhen (is_spm_xlate_flush) {
+      unrolled_cmd.ready := true.B
+      tlb.io.spm_fault_clear := true.B
+      when (unrolled_cmd.fire) {
+        spm_xlate_fault_valid := false.B
+        spm_xlate_fault_vaddr := 0.U
+        spm_xlate_fault_cause := 0.U
+      }
+    }
+
+    .elsewhen (is_spm_xlate_fault) {
+      spm_xlate_resp.valid := unrolled_cmd.valid
+      spm_xlate_resp.bits.rd := unrolled_cmd.bits.cmd.inst.rd
+      spm_xlate_resp.bits.data := Cat(spm_xlate_fault_vaddr(xLen-1, 8), spm_xlate_fault_cause)
+      unrolled_cmd.ready := spm_xlate_resp.ready
     }
 
     .otherwise {

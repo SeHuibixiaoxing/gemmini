@@ -6,6 +6,7 @@ import org.chipsalliance.cde.config._
 import freechips.rocketchip.diplomacy._
 import freechips.rocketchip.tilelink._
 import freechips.rocketchip.subsystem._
+import freechips.rocketchip.devices.tilelink.TLZero
 
 
 case class SharedScratchpadConfig (
@@ -57,7 +58,7 @@ class SharedScratchpad[T <: Data, U <: Data, V <: Data] (
   implicit p: Parameters
 ) extends LazyModule {
 
-  import config.{gemmini_id, dma_maxbytes, dma_buswidth}
+  import config.{gemmini_id, dma_maxbytes, dma_buswidth, is_dummy}
   import config.shared_scratchpad_config._
   
   require(local_bank_interleaved_bytes >= dma_maxbytes)
@@ -65,8 +66,8 @@ class SharedScratchpad[T <: Data, U <: Data, V <: Data] (
 
   // Connected to bus for remote access
   val global_node = TLIdentityNode()
-  // Connected to local DMA for local access
-  val local_node = TLIdentityNode()
+  // Connected to local clients (Gemmini spad DMA path and coupled DMA).
+  val local_node = TLXbar()
   // For TLRAM instantiation and TLFilter
   val bank_addr_sets: Seq[AddressSet] = local_bank_addr_sets(gemmini_id)
 
@@ -78,19 +79,31 @@ class SharedScratchpad[T <: Data, U <: Data, V <: Data] (
   // Device description for DTS
   private val memDevice = new MemoryDevice()
 
-  // Instantiate one TLRAM per bank
+  // Instantiate one memory-like TileLink target per bank.
+  // For dummy Gemmini configs, use TLZero to avoid synthesizing real storage.
   (0 until local_banks).foreach { bank_id => {
-    val bank = LazyModule(new TLRAM(
-      address     = bank_addr_sets(bank_id),
-      beatBytes   = local_bank_beat_bytes,
-      devOverride = Some(memDevice),
-      cacheable   = false,
-      executable  = false,
-      atomics     = false,
-    ))
-    bank.suggestName(s"Gemmini${gemmini_id}-SharedScratchpadBank${bank_id}")
-    bank.node := TLFragmenter(local_bank_beat_bytes, dma_maxbytes) := 
-                 TLBuffer(4) := TLWidthWidget(dma_buswidth / 8) := bank_xbar
+    val bankNode = if (is_dummy) {
+      val bank = LazyModule(new TLZero(
+        address = bank_addr_sets(bank_id),
+        beatBytes = local_bank_beat_bytes,
+      ))
+      bank.suggestName(s"Gemmini${gemmini_id}-SharedScratchpadBank${bank_id}")
+      bank.node
+    } else {
+      val bank = LazyModule(new TLRAM(
+        address     = bank_addr_sets(bank_id),
+        beatBytes   = local_bank_beat_bytes,
+        devOverride = Some(memDevice),
+        cacheable   = false,
+        executable  = false,
+        atomics     = false,
+      ))
+      bank.suggestName(s"Gemmini${gemmini_id}-SharedScratchpadBank${bank_id}")
+      bank.node
+    }
+
+    bankNode := TLFragmenter(local_bank_beat_bytes, dma_maxbytes) :=
+      TLBuffer(4) := TLWidthWidget(dma_buswidth / 8) := bank_xbar
   }}
 
   lazy val module = new Impl

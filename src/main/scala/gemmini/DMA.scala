@@ -184,6 +184,12 @@ class StreamReaderCore[T <: Data, U <: Data, V <: Data](
     val read_sizes = ((aligned_to max beatBytes) to maxBytes by aligned_to).
       filter(s => isPow2(s)).
       filter(s => s % beatBytes == 0)
+    require(
+      read_sizes.nonEmpty,
+      s"Gemmini${config.gemmini_id} StreamReader has no legal read packet sizes: " +
+        s"aligned_to=$aligned_to beatBytes=$beatBytes maxBytes=$maxBytes " +
+        s"dma_buswidth=${config.dma_buswidth} dma_maxbytes=${config.dma_maxbytes}"
+    )
     val read_packets = read_sizes.map { s =>
       val lg_s = log2Ceil(s)
       val vaddr_aligned_to_size = if (s == 1) vaddr else Cat(vaddr(vaddrBits-1, lg_s), 0.U(lg_s.W))
@@ -432,6 +438,12 @@ class StreamWriter[T <: Data: Arithmetic, U <: Data, V <: Data](
       filter(s => isPow2(s)).
       filter(s => s % beatBytes == 0) /*.
       filter(s => s <= dataBytes*2 || s == smallest_write_size)*/
+    require(
+      write_sizes.nonEmpty,
+      s"Gemmini${config.gemmini_id} StreamWriter has no legal write packet sizes: " +
+        s"aligned_to=$aligned_to beatBytes=$beatBytes maxBytes=$maxBytes " +
+        s"dma_buswidth=${config.dma_buswidth} dma_maxbytes=${config.dma_maxbytes}"
+    )
     val write_packets = write_sizes.map { s =>
       val lg_s = log2Ceil(s)
       val vaddr_aligned_to_size = if (s == 1) vaddr else Cat(vaddr(vaddrBits-1, lg_s), 0.U(lg_s.W))
