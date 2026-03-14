@@ -38,15 +38,26 @@ class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](val config: GemminiA
 
   val xLen = p(TileKey).core.xLen
   val spad = LazyModule(new Scratchpad(config))
+  val sharedSpadXlateSourceNodeOpt =
+    if (config.shared_scratchpad_config.enable && config.shared_scratchpad_config.share_xlate_with_coupled_dma) {
+      Some(BundleBridgeSource(() => Output(new SharedSpadXlateConfig)))
+    } else {
+      None
+    }
 
   override lazy val module = new GemminiModule(this)
 
   private val masterNode = TLIdentityNode()
   private val slaveNode = TLIdentityNode()
+  private val masterXbar = TLXbar()
+  val spmPtw = LazyModule(new SpmPageTableWalker(s"gemmini${config.gemmini_id}-spm-ptw"))
+
+  masterNode := masterXbar
+  masterXbar := spmPtw.node
 
   if (!config.shared_scratchpad_config.enable) {
     // If not using shared scratchpad.
-    masterNode := spad.id_node
+    masterXbar := spad.id_node
 
   } else {
     // If using shared scratchpad.
@@ -56,13 +67,18 @@ class Gemmini[T <: Data : Arithmetic, U <: Data, V <: Data](val config: GemminiA
       .foreach { client =>
         sharedSpad.local_node := client
       }
+    sharedSpadXlateSourceNodeOpt.foreach { node =>
+      CoupledSharedSpadRegistry
+        .registerXlateNode(config.gemmini_id, sink => sink := node)
+        .foreach { sink => sink := node }
+    }
     sharedSpad.global_node := TLBuffer() := slaveNode
 
     val xbar = TLXbar()
     xbar := spad.id_node
     sharedSpad.local_node := xbar
-    masterNode := TLFilter(TLFilter.mSubtract(sharedSpad.bank_addr_sets)) := 
-                  TLWidthWidget(config.dma_buswidth / 8) := xbar
+    masterXbar := TLFilter(TLFilter.mSubtract(sharedSpad.bank_addr_sets)) :=
+      TLWidthWidget(config.dma_buswidth / 8) := xbar
   }
 
   override val tlNode = if (config.use_dedicated_tl_port) masterNode else TLIdentityNode()
@@ -117,19 +133,45 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
   val spm_xlate_fault_vaddr = RegInit(0.U(xLen.W))
   val spm_xlate_fault_cause = RegInit(0.U(8.W))
   val spm_xlate_fault_valid = RegInit(false.B)
+  val spm_xlate_cache_epoch = RegInit(0.U(8.W))
 
+  val spmCacheClear = WireInit(false.B)
+
+  tlb.io.spm_use_ptw := outer.config.shared_scratchpad_config.use_page_table_xlate.B
   tlb.io.spm_xlate_enable := spm_xlate_enable
   tlb.io.spm_xlate_page_shift := spm_xlate_page_shift
   tlb.io.spm_xlate_pte_count := spm_xlate_pte_count
+  tlb.io.spm_xlate_ptbr := spm_xlate_ptbr(paddrBits - 1, 0)
   tlb.io.spm_xlate_range_base := spm_xlate_range_base
   tlb.io.spm_xlate_range_size := spm_xlate_range_size
   tlb.io.spm_xlate_shared_base := outer.config.shared_scratchpad_config.global_base_addr.U(paddrBits.W)
+  tlb.io.spm_cache_clear := spmCacheClear
   tlb.io.spm_fault_clear := false.B
+  outer.spmPtw.module.io.req <> tlb.io.spm_ptw_req
+  outer.spmPtw.module.io.resp <> tlb.io.spm_ptw_resp
+
+  when (spmCacheClear) {
+    spm_xlate_cache_epoch := spm_xlate_cache_epoch + 1.U
+  }
 
   when (tlb.io.spm_fault_valid) {
     spm_xlate_fault_valid := true.B
     spm_xlate_fault_vaddr := tlb.io.spm_fault_vaddr
     spm_xlate_fault_cause := tlb.io.spm_fault_cause
+  }
+
+  outer.sharedSpadXlateSourceNodeOpt.foreach { node =>
+    node.out.headOption.foreach { case (cfg, _) =>
+      cfg.use_ptw := outer.config.shared_scratchpad_config.use_page_table_xlate.B
+      cfg.enable := spm_xlate_enable
+      cfg.page_shift := spm_xlate_page_shift
+      cfg.pte_count := spm_xlate_pte_count
+      cfg.ptbr := spm_xlate_ptbr(paddrBits - 1, 0)
+      cfg.range_base := spm_xlate_range_base
+      cfg.range_size := spm_xlate_range_size
+      cfg.shared_base := outer.config.shared_scratchpad_config.global_base_addr.U(paddrBits.W)
+      cfg.cache_epoch := spm_xlate_cache_epoch
+    }
   }
 
   tlb.io.exp.foreach(_.flush_skip := false.B)
@@ -467,6 +509,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
         spm_xlate_page_shift := rs2(15, 8)
         spm_xlate_enable := rs2(0)
         spm_xlate_fault_valid := false.B
+        spmCacheClear := true.B
       }
     }
 
@@ -475,6 +518,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
       when (unrolled_cmd.fire) {
         spm_xlate_range_base := unrolled_cmd.bits.cmd.rs1
         spm_xlate_range_size := unrolled_cmd.bits.cmd.rs2
+        spmCacheClear := true.B
       }
     }
 
@@ -485,6 +529,7 @@ class GemminiModule[T <: Data: Arithmetic, U <: Data, V <: Data]
         spm_xlate_fault_valid := false.B
         spm_xlate_fault_vaddr := 0.U
         spm_xlate_fault_cause := 0.U
+        spmCacheClear := true.B
       }
     }
 

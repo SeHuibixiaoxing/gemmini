@@ -81,7 +81,6 @@ class DecoupledTLB(entries: Int, maxSize: Int, use_firesim_simulation_counters: 
 
 class FrontendTLBIO(implicit p: Parameters) extends CoreBundle {
   val lgMaxSize = log2Ceil(coreDataBytes)
-  // val req = Decoupled(new TLBReq(lgMaxSize))
   val req = Valid(new DecoupledTLBReq(lgMaxSize))
   val resp = Flipped(new TLBResp)
 }
@@ -91,6 +90,7 @@ class FrontendTLB(nClients: Int, entries: Int, maxSize: Int, use_tlb_register_fi
 
   val num_tlbs = if (use_shared_tlb) 1 else nClients
   val lgMaxSize = log2Ceil(coreDataBytes)
+  val spmRefillIdxWidth = log2Ceil(entries max 2)
 
   val io = IO(new Bundle {
     val clients = Flipped(Vec(nClients, new FrontendTLBIO))
@@ -98,17 +98,22 @@ class FrontendTLB(nClients: Int, entries: Int, maxSize: Int, use_tlb_register_fi
     val exp = Vec(num_tlbs, new TLBExceptionIO)
     val counter = new CounterEventIO()
 
-    // Shared-spad translation control (dual path: DRAM TLB + shared-spad direct translation).
+    // Shared-spad translation control.
+    val spm_use_ptw = Input(Bool())
     val spm_xlate_enable = Input(Bool())
     val spm_xlate_page_shift = Input(UInt(8.W))
     val spm_xlate_pte_count = Input(UInt(16.W))
+    val spm_xlate_ptbr = Input(UInt(paddrBits.W))
     val spm_xlate_range_base = Input(UInt(vaddrBits.W))
     val spm_xlate_range_size = Input(UInt(vaddrBits.W))
     val spm_xlate_shared_base = Input(UInt(paddrBits.W))
+    val spm_cache_clear = Input(Bool())
     val spm_fault_clear = Input(Bool())
     val spm_fault_valid = Output(Bool())
     val spm_fault_vaddr = Output(UInt(vaddrBits.W))
     val spm_fault_cause = Output(UInt(8.W))
+    val spm_ptw_req = Decoupled(new SpmPtwReq)
+    val spm_ptw_resp = Flipped(Valid(new SpmPtwResp))
   })
 
   val spm_fault_valid = RegInit(false.B)
@@ -138,71 +143,154 @@ class FrontendTLB(nClients: Int, entries: Int, maxSize: Int, use_tlb_register_fi
     tlbArb.io.out.ready := true.B
   }
 
+  val spmTlbValid = RegInit(VecInit(Seq.fill(entries)(false.B)))
+  val spmTlbVpn = Reg(Vec(entries, UInt(vaddrBits.W)))
+  val spmTlbPaddrBase = Reg(Vec(entries, UInt(paddrBits.W)))
+  val spmRefillPtr = RegInit(0.U(spmRefillIdxWidth.W))
+
+  val spmPtwPendingValid = RegInit(false.B)
+  val spmPtwPendingVpn = RegInit(0.U(vaddrBits.W))
+  val spmPtwPendingVaddr = RegInit(0.U(vaddrBits.W))
+
+  val tlbFlush = tlbs.map(_.io.exp.flush()).reduce(_ || _)
+  val spmCacheInvalidate = io.spm_cache_clear || tlbFlush
+  when (spmCacheInvalidate) {
+    spmTlbValid.foreach(_ := false.B)
+    spmPtwPendingValid := false.B
+  }
+
+  when (io.spm_ptw_resp.valid && spmPtwPendingValid) {
+    spmPtwPendingValid := false.B
+
+    when (io.spm_ptw_resp.bits.accessFault) {
+      when (!spm_fault_valid) {
+        spm_fault_valid := true.B
+        spm_fault_vaddr := io.spm_ptw_resp.bits.vaddr
+        spm_fault_cause := 3.U // shared-spad PTE access fault
+      }
+    }.elsewhen (!io.spm_ptw_resp.bits.pte(0)) {
+      when (!spm_fault_valid) {
+        spm_fault_valid := true.B
+        spm_fault_vaddr := io.spm_ptw_resp.bits.vaddr
+        spm_fault_cause := 2.U // invalid shared-spad PTE
+      }
+    }.otherwise {
+      val refillIdx = spmRefillPtr
+      val paddrBase = ((io.spm_ptw_resp.bits.pte(63, 1).asUInt << io.spm_ptw_resp.bits.pageShift)(paddrBits - 1, 0))
+      spmTlbValid(refillIdx) := true.B
+      spmTlbVpn(refillIdx) := io.spm_ptw_resp.bits.vpn
+      spmTlbPaddrBase(refillIdx) := paddrBase
+      if (entries > 1) {
+        spmRefillPtr := Mux(spmRefillPtr === (entries - 1).U, 0.U, spmRefillPtr + 1.U)
+      }
+    }
+  }
+
+  val spmPtwReqValid = WireInit(VecInit(Seq.fill(nClients)(false.B)))
+  val spmPtwReqBits = Wire(Vec(nClients, new SpmPtwReq))
+  spmPtwReqBits.foreach(_ := 0.U.asTypeOf(new SpmPtwReq))
+
   io.clients.zipWithIndex.foreach { case (client, i) =>
-    val last_translated_valid = RegInit(false.B)
-    val last_translated_vpn = RegInit(0.U(vaddrBits.W))
-    val last_translated_ppn = RegInit(0.U(paddrBits.W))
+    val lastDramTranslatedValid = RegInit(false.B)
+    val lastDramTranslatedVpn = RegInit(0.U(vaddrBits.W))
+    val lastDramTranslatedPaddr = RegInit(0.U(paddrBits.W))
 
-    val req_vaddr = client.req.bits.tlb_req.vaddr
-    val spm_range_end = io.spm_xlate_range_base + io.spm_xlate_range_size
-    val spm_in_range = io.spm_xlate_enable && (io.spm_xlate_range_size =/= 0.U) &&
-      req_vaddr >= io.spm_xlate_range_base && req_vaddr < spm_range_end
-    val spm_page_shift = Mux(io.spm_xlate_page_shift < pgIdxBits.U, pgIdxBits.U, io.spm_xlate_page_shift)
-    val spm_offset = req_vaddr - io.spm_xlate_range_base
-    val spm_vpn = spm_offset >> spm_page_shift
-    val spm_pte_ok = spm_vpn < io.spm_xlate_pte_count
-    val spm_hit = spm_in_range && spm_pte_ok
-    val spm_paddr = io.spm_xlate_shared_base + spm_offset
+    val reqVaddr = client.req.bits.tlb_req.vaddr
+    val spmRangeEnd = io.spm_xlate_range_base + io.spm_xlate_range_size
+    val spmRangeHit = (io.spm_xlate_range_size =/= 0.U) &&
+      reqVaddr >= io.spm_xlate_range_base && reqVaddr < spmRangeEnd
+    // Shared-spad translation uses its own software-programmed page size; do not clamp it to the CPU\x27s 4 KiB page size.
+    val spmPageShift = io.spm_xlate_page_shift
+    val spmOffset = reqVaddr - io.spm_xlate_range_base
+    val spmVpn = spmOffset >> spmPageShift
+    val spmVpnInBounds = spmVpn < io.spm_xlate_pte_count
+    val spmPageOffset = spmOffset - (spmVpn << spmPageShift)
 
-    val l0_tlb_hit = (last_translated_valid &&
-      ((req_vaddr >> pgIdxBits).asUInt === (last_translated_vpn >> pgIdxBits).asUInt)) || spm_hit
-    val cached_l0_paddr = Cat(last_translated_ppn >> pgIdxBits, req_vaddr(pgIdxBits-1,0))
-    val l0_tlb_paddr = Mux(spm_hit, spm_paddr, cached_l0_paddr)
+    val spmTlbHits = VecInit(spmTlbValid.zip(spmTlbVpn).map { case (valid, vpn) => valid && vpn === spmVpn })
+    val spmTlbHit = spmTlbHits.asUInt.orR
+    val spmTlbBase = Mux(spmTlbHit, Mux1H(spmTlbHits, spmTlbPaddrBase), 0.U(paddrBits.W))
+    val spmPendingHit = spmPtwPendingValid && spmPtwPendingVpn === spmVpn
+
+    val useSpmPtw = io.spm_use_ptw && spmRangeHit
+    val spmDirectHit = !io.spm_use_ptw && io.spm_xlate_enable && spmRangeHit && spmVpnInBounds
+    val spmPassthroughHit = io.spm_use_ptw && !io.spm_xlate_enable && spmRangeHit
+    val spmPtwHit = io.spm_use_ptw && io.spm_xlate_enable && spmRangeHit && spmTlbHit
+    val spmHit = spmDirectHit || spmPassthroughHit || spmPtwHit
+
+    val spmDirectPaddr = io.spm_xlate_shared_base + spmOffset
+    val spmTranslatedPaddr = spmTlbBase + spmPageOffset
+    val spmPaddr = Mux(spmPassthroughHit, reqVaddr, Mux(spmPtwHit, spmTranslatedPaddr, spmDirectPaddr))
+
+    val dramL0Hit = lastDramTranslatedValid &&
+      ((reqVaddr >> pgIdxBits).asUInt === (lastDramTranslatedVpn >> pgIdxBits).asUInt)
+    val cachedDramPaddr = Cat(lastDramTranslatedPaddr >> pgIdxBits, reqVaddr(pgIdxBits - 1, 0))
+    val l0TlbHit = dramL0Hit || spmHit
+    val l0TlbPaddr = Mux(spmHit, spmPaddr, cachedDramPaddr)
 
     val tlb = if (use_shared_tlb) tlbs.head else tlbs(i)
     val tlbReq = if (use_shared_tlb) tlbArbOpt.get.io.in(i).bits else tlb.io.req.bits
     val tlbReqValid = if (use_shared_tlb) tlbArbOpt.get.io.in(i).valid else tlb.io.req.valid
     val tlbReqFire = if (use_shared_tlb) tlbArbOpt.get.io.in(i).fire else tlb.io.req.fire
 
-    tlbReqValid := RegNext(client.req.valid && !l0_tlb_hit && !spm_in_range)
+    tlbReqValid := RegNext(client.req.valid && !dramL0Hit && !spmRangeHit)
     tlbReq := RegNext(client.req.bits)
 
-    when (client.req.valid && spm_hit) {
-      last_translated_valid := true.B
-      last_translated_vpn := req_vaddr
-      last_translated_ppn := spm_paddr
-    }.elsewhen (tlbReqFire && !tlb.io.resp.miss) {
-      last_translated_valid := true.B
-      last_translated_vpn := tlbReq.tlb_req.vaddr
-      last_translated_ppn := tlb.io.resp.paddr
+    when (tlbReqFire && !tlb.io.resp.miss) {
+      lastDramTranslatedValid := true.B
+      lastDramTranslatedVpn := tlbReq.tlb_req.vaddr
+      lastDramTranslatedPaddr := tlb.io.resp.paddr
     }
 
-    when (tlb.io.exp.flush()) {
-      last_translated_valid := false.B
+    when (spmCacheInvalidate) {
+      lastDramTranslatedValid := false.B
     }
 
-    when (client.req.valid && spm_in_range && !spm_pte_ok && !spm_fault_valid) {
+    when (client.req.valid && !io.spm_use_ptw && io.spm_xlate_enable && spmRangeHit && !spmVpnInBounds && !spm_fault_valid) {
       spm_fault_valid := true.B
-      spm_fault_vaddr := req_vaddr
-      spm_fault_cause := 2.U // invalid shared-spad pte index
+      spm_fault_vaddr := reqVaddr
+      spm_fault_cause := 2.U // legacy direct translation out-of-range
     }
+
+    when (client.req.valid && io.spm_use_ptw && io.spm_xlate_enable && spmRangeHit && !spmVpnInBounds && !spm_fault_valid) {
+      spm_fault_valid := true.B
+      spm_fault_vaddr := reqVaddr
+      spm_fault_cause := 1.U // shared-spad vaddr outside programmed PTE range
+    }
+
+    spmPtwReqValid(i) := client.req.valid && useSpmPtw && io.spm_xlate_enable && spmVpnInBounds && !spmTlbHit && !spmPendingHit && !spmPtwPendingValid
+    spmPtwReqBits(i).vpn := spmVpn
+    spmPtwReqBits(i).vaddr := reqVaddr
+    spmPtwReqBits(i).ptbr := io.spm_xlate_ptbr
+    spmPtwReqBits(i).pageShift := spmPageShift
 
     when (tlbReqFire) {
       client.resp := tlb.io.resp
     }.otherwise {
       client.resp := DontCare
-      client.resp.paddr := RegNext(l0_tlb_paddr)
-      client.resp.miss := !RegNext(l0_tlb_hit)
+      client.resp.paddr := RegNext(l0TlbPaddr)
+      client.resp.miss := !RegNext(l0TlbHit)
     }
 
-    // If we're not using the TLB filter register, then we set this value to always be false
     if (!use_tlb_register_filter) {
-      last_translated_valid := false.B
+      lastDramTranslatedValid := false.B
     }
   }
 
-  // TODO Return the sum of the TLB counters, rather than just the counters of the first TLB. This only matters if we're
-  // not using the shared TLB
+  val spmPtwArb = Module(new RRArbiter(new SpmPtwReq, nClients))
+  spmPtwArb.io.in.zipWithIndex.foreach { case (in, i) =>
+    in.valid := spmPtwReqValid(i)
+    in.bits := spmPtwReqBits(i)
+  }
+  io.spm_ptw_req.valid := spmPtwArb.io.out.valid
+  io.spm_ptw_req.bits := spmPtwArb.io.out.bits
+  spmPtwArb.io.out.ready := io.spm_ptw_req.ready
+
+  when (io.spm_ptw_req.fire) {
+    spmPtwPendingValid := true.B
+    spmPtwPendingVpn := io.spm_ptw_req.bits.vpn
+    spmPtwPendingVaddr := io.spm_ptw_req.bits.vaddr
+  }
+
   io.counter := DontCare
   tlbs.foreach(_.io.counter.external_reset := false.B)
   io.counter.collect(tlbs.head.io.counter)

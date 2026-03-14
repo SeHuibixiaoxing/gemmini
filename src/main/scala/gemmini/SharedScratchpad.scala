@@ -22,6 +22,10 @@ case class SharedScratchpadConfig (
   val local_bank_interleaved_bytes: Int = 64,
   // Beat size of banks.
   val local_bank_beat_bytes: Int = 64,
+  // Enable software-programmed shared-spad page-table translation.
+  val use_page_table_xlate: Boolean = false,
+  // Export the shared-spad translation context to the coupled DMA path.
+  val share_xlate_with_coupled_dma: Boolean = false,
 ) {
   require(local_size_bytes > 0 && isPow2(local_size_bytes))
   require(local_banks > 0 && isPow2(local_banks))
