@@ -7,16 +7,21 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.diplomacy.LazyModule
 import freechips.rocketchip.rocket.HellaCacheArbiter
 import freechips.rocketchip.tile.{LazyRoCC, LazyRoCCModuleImp, OpcodeSet, RoCCResponse}
-import freechips.rocketchip.tilelink.{TLBuffer, TLIdentityNode, TLXbar}
+import freechips.rocketchip.tilelink.{TLBuffer, TLIdentityNode, TLSourceShrinker, TLXbar}
 
 class GemminiCoupledDMAPairWrapper[T <: Data : Arithmetic, U <: Data, V <: Data](
   baseGemminiConfig: GemminiArrayConfig[T, U, V],
   pairId: Int,
-  sharedScratchpadConfig: SharedScratchpadConfig
+  sharedScratchpadConfig: SharedScratchpadConfig,
+  tlMaxInFlight: Option[Int] = None,
+  atlMaxInFlight: Option[Int] = None
 )(implicit p: Parameters)
     extends LazyRoCC(
       opcodes = OpcodeSet.custom2 | OpcodeSet.custom3,
       nPTWPorts = (if (baseGemminiConfig.use_shared_tlb) 1 else 2)) {
+
+  tlMaxInFlight.foreach(v => require(v > 0, s"tlMaxInFlight must be > 0 when set, got $v"))
+  atlMaxInFlight.foreach(v => require(v > 0, s"atlMaxInFlight must be > 0 when set, got $v"))
 
   private val gemminiConfig = baseGemminiConfig.copy(
     opcodes = OpcodeSet.custom3,
@@ -35,6 +40,8 @@ class GemminiCoupledDMAPairWrapper[T <: Data : Arithmetic, U <: Data, V <: Data]
   private val tlXbar = TLXbar()
   private val atlXbar = TLXbar()
   private val stlXbar = TLXbar()
+  private val tlShrinkNode = tlMaxInFlight.map(TLSourceShrinker(_)).getOrElse(TLIdentityNode())
+  private val atlShrinkNode = atlMaxInFlight.map(TLSourceShrinker(_)).getOrElse(TLIdentityNode())
 
   override val tlNode = TLIdentityNode()
   override val atlNode = TLIdentityNode()
@@ -43,11 +50,11 @@ class GemminiCoupledDMAPairWrapper[T <: Data : Arithmetic, U <: Data, V <: Data]
 
   tlXbar :=* gemmini.tlNode
   tlXbar :=* dma.tlNode
-  tlNode :=* TLBuffer() :=* tlXbar
+  tlNode :=* TLBuffer() :=* tlShrinkNode :=* tlXbar
 
   atlXbar :=* gemmini.atlNode
   atlXbar :=* dma.atlNode
-  atlNode :=* TLBuffer() :=* atlXbar
+  atlNode :=* TLBuffer() :=* atlShrinkNode :=* atlXbar
 
   gemmini.stlNode :*= stlXbar
   dma.stlNode :*= stlXbar
