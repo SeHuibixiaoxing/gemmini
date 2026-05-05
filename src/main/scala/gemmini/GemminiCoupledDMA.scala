@@ -117,16 +117,20 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
   val cycleCount = RegInit(0.U(64.W))
   cycleCount := cycleCount + 1.U
 
-  val sIdle :: sIssueGet :: sWaitGet :: sIssuePut :: sWaitPut :: sIssueFlag :: sWaitFlag :: Nil = Enum(7)
+  val Seq(sIdle, sIssueGet0, sWaitGet0, sIssueGet1, sWaitGet1,
+    sIssuePut, sWaitPut, sIssueFlag, sWaitFlag) = Enum(9)
   val state = RegInit(sIdle)
 
   val curSrc = Reg(UInt(xLenBits.W))
   val curDst = Reg(UInt(xLenBits.W))
   val curRemaining = Reg(UInt(xLenBits.W))
   val curCompletionAddr = Reg(UInt(xLenBits.W))
-  val curReadData = Reg(UInt(dataBits.W))
+  val curReadDataLo = Reg(UInt(dataBits.W))
+  val curReadDataHi = Reg(UInt(dataBits.W))
   val curXferBytes = Reg(UInt(log2Ceil(wideBytes + 1).W))
-  val curLgSize = Reg(UInt(4.W))
+  val cachedReadValid = RegInit(false.B)
+  val cachedReadBase = RegInit(0.U(xLenBits.W))
+  val cachedReadData = RegInit(0.U(dataBits.W))
 
   val sharedSpadXlateCfg = Wire(new SharedSpadXlateConfig)
   sharedSpadXlateCfg := 0.U.asTypeOf(new SharedSpadXlateConfig)
@@ -191,96 +195,85 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
     spmPtwPendingValid := false.B
   }
 
-  val resolvedSrcAddr = Wire(UInt(xLenBits.W))
-  val resolvedDstAddr = Wire(UInt(xLenBits.W))
-  resolvedSrcAddr := curSrc
-  resolvedDstAddr := curDst
-
-  val srcIssueBlocked = WireInit(false.B)
-  val dstIssueBlocked = WireInit(false.B)
-  val srcNeedPtwReq = WireInit(false.B)
-  val dstNeedPtwReq = WireInit(false.B)
-  val srcPtwReq = Wire(new SpmPtwReq)
-  val dstPtwReq = Wire(new SpmPtwReq)
-  srcPtwReq := 0.U.asTypeOf(new SpmPtwReq)
-  dstPtwReq := 0.U.asTypeOf(new SpmPtwReq)
-
-  if (exportSharedSpadXlate) {
-    val srcVaddr = curSrc(vaddrBits - 1, 0)
-    val srcRangeEnd = sharedSpadXlateCfg.range_base + sharedSpadXlateCfg.range_size
-    val srcRangeHit = (sharedSpadXlateCfg.range_size =/= 0.U) &&
-      srcVaddr >= sharedSpadXlateCfg.range_base && srcVaddr < srcRangeEnd
-    val srcPageShift = sharedSpadXlateCfg.page_shift
-    val srcOffset = srcVaddr - sharedSpadXlateCfg.range_base
-    val srcVpn = srcOffset >> srcPageShift
-    val srcVpnInBounds = srcVpn < sharedSpadXlateCfg.pte_count
-    val srcPageOffset = srcOffset - (srcVpn << srcPageShift)
-    val srcTlbHits = VecInit(spmTlbValid.zip(spmTlbVpn).map { case (valid, vpn) => valid && vpn === srcVpn })
-    val srcTlbHit = srcTlbHits.asUInt.orR
-    val srcTlbBase = Mux(srcTlbHit, Mux1H(srcTlbHits, spmTlbPaddrBase), 0.U(paddrBits.W))
-    val srcPendingHit = spmPtwPendingValid && spmPtwPendingVpn === srcVpn
-    val srcDirectHit = !sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && srcRangeHit && srcVpnInBounds
-    val srcPassthroughHit = sharedSpadXlateCfg.use_ptw && !sharedSpadXlateCfg.enable && srcRangeHit
-    val srcPtwHit = sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && srcRangeHit && srcTlbHit
-    val srcDirectPaddr = sharedSpadXlateCfg.shared_base + srcOffset
-    val srcTranslatedPaddr = srcTlbBase + srcPageOffset
-    val srcPaddr = Mux(srcPassthroughHit, curSrc, Mux(srcPtwHit, srcTranslatedPaddr, srcDirectPaddr))
-    val srcRangeFault = sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && srcRangeHit && !srcVpnInBounds
-    val srcWaitForXlate = sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && srcRangeHit && srcVpnInBounds && !srcTlbHit
-    srcNeedPtwReq := srcWaitForXlate && !srcPendingHit && !spmPtwPendingValid
-    srcIssueBlocked := srcRangeFault || srcWaitForXlate
-    when (srcRangeFault) {
-      assert(false.B, "GemminiCoupledDMA src shared-spad vaddr outside programmed PTE range")
-    }
-    when (srcDirectHit || srcPassthroughHit || srcPtwHit) {
-      resolvedSrcAddr := srcPaddr
-    }
-    srcPtwReq.vpn := srcVpn
-    srcPtwReq.vaddr := srcVaddr
-    srcPtwReq.ptbr := sharedSpadXlateCfg.ptbr
-    srcPtwReq.pageShift := srcPageShift
-
-    val dstVaddr = curDst(vaddrBits - 1, 0)
-    val dstRangeEnd = sharedSpadXlateCfg.range_base + sharedSpadXlateCfg.range_size
-    val dstRangeHit = (sharedSpadXlateCfg.range_size =/= 0.U) &&
-      dstVaddr >= sharedSpadXlateCfg.range_base && dstVaddr < dstRangeEnd
-    val dstPageShift = sharedSpadXlateCfg.page_shift
-    val dstOffset = dstVaddr - sharedSpadXlateCfg.range_base
-    val dstVpn = dstOffset >> dstPageShift
-    val dstVpnInBounds = dstVpn < sharedSpadXlateCfg.pte_count
-    val dstPageOffset = dstOffset - (dstVpn << dstPageShift)
-    val dstTlbHits = VecInit(spmTlbValid.zip(spmTlbVpn).map { case (valid, vpn) => valid && vpn === dstVpn })
-    val dstTlbHit = dstTlbHits.asUInt.orR
-    val dstTlbBase = Mux(dstTlbHit, Mux1H(dstTlbHits, spmTlbPaddrBase), 0.U(paddrBits.W))
-    val dstPendingHit = spmPtwPendingValid && spmPtwPendingVpn === dstVpn
-    val dstDirectHit = !sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && dstRangeHit && dstVpnInBounds
-    val dstPassthroughHit = sharedSpadXlateCfg.use_ptw && !sharedSpadXlateCfg.enable && dstRangeHit
-    val dstPtwHit = sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && dstRangeHit && dstTlbHit
-    val dstDirectPaddr = sharedSpadXlateCfg.shared_base + dstOffset
-    val dstTranslatedPaddr = dstTlbBase + dstPageOffset
-    val dstPaddr = Mux(dstPassthroughHit, curDst, Mux(dstPtwHit, dstTranslatedPaddr, dstDirectPaddr))
-    val dstRangeFault = sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && dstRangeHit && !dstVpnInBounds
-    val dstWaitForXlate = sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && dstRangeHit && dstVpnInBounds && !dstTlbHit
-    dstNeedPtwReq := dstWaitForXlate && !dstPendingHit && !spmPtwPendingValid
-    dstIssueBlocked := dstRangeFault || dstWaitForXlate
-    when (dstRangeFault) {
-      assert(false.B, "GemminiCoupledDMA dst shared-spad vaddr outside programmed PTE range")
-    }
-    when (dstDirectHit || dstPassthroughHit || dstPtwHit) {
-      resolvedDstAddr := dstPaddr
-    }
-    dstPtwReq.vpn := dstVpn
-    dstPtwReq.vaddr := dstVaddr
-    dstPtwReq.ptbr := sharedSpadXlateCfg.ptbr
-    dstPtwReq.pageShift := dstPageShift
+  class ResolvedCopyAddr extends Bundle {
+    val paddr = UInt(xLenBits.W)
+    val issueBlocked = Bool()
+    val needPtwReq = Bool()
+    val ptwReq = new SpmPtwReq
   }
 
-  when (state === sIssueGet && srcNeedPtwReq) {
+  def resolveCopyAddr(rawAddr: UInt, errorLabel: String): ResolvedCopyAddr = {
+    val resolved = Wire(new ResolvedCopyAddr)
+    resolved := 0.U.asTypeOf(new ResolvedCopyAddr)
+    resolved.paddr := rawAddr
+
+    if (exportSharedSpadXlate) {
+      val vaddr = rawAddr(vaddrBits - 1, 0)
+      val rangeEnd = sharedSpadXlateCfg.range_base + sharedSpadXlateCfg.range_size
+      val rangeHit = (sharedSpadXlateCfg.range_size =/= 0.U) &&
+        vaddr >= sharedSpadXlateCfg.range_base && vaddr < rangeEnd
+      val pageShift = sharedSpadXlateCfg.page_shift
+      val offset = vaddr - sharedSpadXlateCfg.range_base
+      val vpn = offset >> pageShift
+      val vpnInBounds = vpn < sharedSpadXlateCfg.pte_count
+      val pageOffset = offset - (vpn << pageShift)
+      val tlbHits = VecInit(spmTlbValid.zip(spmTlbVpn).map { case (valid, tlbVpn) => valid && tlbVpn === vpn })
+      val tlbHit = tlbHits.asUInt.orR
+      val tlbBase = Mux(tlbHit, Mux1H(tlbHits, spmTlbPaddrBase), 0.U(paddrBits.W))
+      val pendingHit = spmPtwPendingValid && spmPtwPendingVpn === vpn
+      val directHit = !sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && rangeHit && vpnInBounds
+      val passthroughHit = sharedSpadXlateCfg.use_ptw && !sharedSpadXlateCfg.enable && rangeHit
+      val ptwHit = sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && rangeHit && tlbHit
+      val directPaddr = sharedSpadXlateCfg.shared_base + offset
+      val translatedPaddr = tlbBase + pageOffset
+      val paddr = Mux(passthroughHit, rawAddr, Mux(ptwHit, translatedPaddr, directPaddr))
+      val rangeFault = sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable && rangeHit && !vpnInBounds
+      val waitForXlate = sharedSpadXlateCfg.use_ptw && sharedSpadXlateCfg.enable &&
+        rangeHit && vpnInBounds && !tlbHit
+
+      resolved.issueBlocked := rangeFault || waitForXlate
+      resolved.needPtwReq := waitForXlate && !pendingHit && !spmPtwPendingValid
+      when (rangeFault) {
+        assert(false.B, s"GemminiCoupledDMA ${errorLabel} shared-spad vaddr outside programmed PTE range")
+      }
+      when (directHit || passthroughHit || ptwHit) {
+        resolved.paddr := paddr
+      }
+      resolved.ptwReq.vpn := vpn
+      resolved.ptwReq.vaddr := vaddr
+      resolved.ptwReq.ptbr := sharedSpadXlateCfg.ptbr
+      resolved.ptwReq.pageShift := pageShift
+    }
+
+    resolved
+  }
+
+  private val beatAddrMask = ~((wideBytes - 1).U(xLenBits.W))
+  private val zeroBeatOffset = 0.U(1.W)
+  val curSrcBeatOffset = if (beatOffBits > 0) curSrc(beatOffBits - 1, 0) else zeroBeatOffset
+  val curDstBeatOffset = if (beatOffBits > 0) curDst(beatOffBits - 1, 0) else zeroBeatOffset
+  val curSrcBeatAligned = if (beatOffBits > 0) curSrcBeatOffset === 0.U else true.B
+  val curDstBeatAligned = if (beatOffBits > 0) curDstBeatOffset === 0.U else true.B
+  val curSrcBeatBase = curSrc & beatAddrMask
+  val curDstBeatBase = curDst & beatAddrMask
+  val dstBytesLeftInBeat = wideBytes.U(xLenBits.W) - curDstBeatOffset
+  val canWide = curSrcBeatAligned && curDstBeatAligned && curRemaining >= wideBytes.U
+  val nextXferBytesWide = Mux(canWide, wideBytes.U(xLenBits.W), Mux(curRemaining < dstBytesLeftInBeat, curRemaining, dstBytesLeftInBeat))
+  val needSecondRead = !canWide && (curSrcBeatOffset + nextXferBytesWide) > wideBytes.U
+  val cacheHitLo = cachedReadValid && (cachedReadBase === curSrcBeatBase)
+  val shouldIssueGet0 = state === sIssueGet0 && !cacheHitLo
+  val shouldIssueGet1 = state === sIssueGet1
+  val issueReadAddr = Mux(state === sIssueGet1, curSrcBeatBase + wideBytes.U, curSrcBeatBase)
+  val issueWriteAddr = Mux(state === sIssueFlag, curCompletionAddr, curDstBeatBase)
+  val readResolvedAddr = resolveCopyAddr(issueReadAddr, "src")
+  val writeResolvedAddr = resolveCopyAddr(issueWriteAddr, "dst")
+
+  when ((shouldIssueGet0 || shouldIssueGet1) && readResolvedAddr.needPtwReq) {
     spmPtwReqValid := true.B
-    spmPtwReqBits := srcPtwReq
-  } .elsewhen (state === sIssuePut && dstNeedPtwReq) {
+    spmPtwReqBits := readResolvedAddr.ptwReq
+  } .elsewhen (state === sIssuePut && writeResolvedAddr.needPtwReq) {
     spmPtwReqValid := true.B
-    spmPtwReqBits := dstPtwReq
+    spmPtwReqBits := writeResolvedAddr.ptwReq
   }
 
   when (spmPtwReqValid && spmPtwReqReady) {
@@ -288,33 +281,32 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
     spmPtwPendingVpn := spmPtwReqBits.vpn
   }
 
-  val srcBeatAligned = if (beatOffBits > 0) curSrc(beatOffBits - 1, 0) === 0.U else true.B
-  val dstBeatAligned = if (beatOffBits > 0) curDst(beatOffBits - 1, 0) === 0.U else true.B
-  val canWide = srcBeatAligned && dstBeatAligned && curRemaining >= wideBytes.U
-  val nextXferBytes = Mux(canWide, wideBytes.U, 1.U)
-  val nextLgSize = Mux(canWide, wideLgSize, 0.U)
-
-  val srcByteShift = Cat(curSrc(beatOffBits - 1, 0), 0.U(3.W))
-  val dstByteShift = Cat(curDst(beatOffBits - 1, 0), 0.U(3.W))
-  val movedByte = (curReadData >> srcByteShift)(7, 0)
-  val bytePutData = (movedByte.asUInt << dstByteShift)(dataBits - 1, 0)
-  val widePutData = curReadData
-  val copyPutData = Mux(curXferBytes === wideBytes.U, widePutData, bytePutData)
-
-  val flagByteShift = Cat(curCompletionAddr(beatOffBits - 1, 0), 0.U(3.W))
+  val srcShiftBits = Cat(curSrcBeatOffset, 0.U(3.W))
+  val dstShiftBits = Cat(curDstBeatOffset, 0.U(3.W))
+  val readWindow = Cat(curReadDataHi, curReadDataLo)
+  val copyPutData = ((readWindow >> srcShiftBits)(dataBits - 1, 0) << dstShiftBits)(dataBits - 1, 0)
+  val copyPutMask = VecInit((0 until beatBytes).map { i =>
+    i.U >= curDstBeatOffset && i.U < (curDstBeatOffset + curXferBytes)
+  }).asUInt
+  val flagBeatOffset = if (beatOffBits > 0) curCompletionAddr(beatOffBits - 1, 0) else zeroBeatOffset
+  val flagByteShift = Cat(flagBeatOffset, 0.U(3.W))
   val flagPutData = (1.U(dataBits.W) << flagByteShift)(dataBits - 1, 0)
 
-  val (_, getBits) = edge.Get(0.U, resolvedSrcAddr, nextLgSize)
-  val (_, putCopyBits) = edge.Put(1.U, resolvedDstAddr, curLgSize, copyPutData)
+  val (_, getBits) = edge.Get(0.U, readResolvedAddr.paddr, wideLgSize)
+  val (_, putCopyFullBits) = edge.Put(1.U, writeResolvedAddr.paddr, wideLgSize, copyPutData)
+  val (_, putCopyPartialBits) = edge.Put(1.U, writeResolvedAddr.paddr, wideLgSize, copyPutData, copyPutMask)
+  val putCopyBits = Wire(chiselTypeOf(putCopyFullBits))
+  putCopyBits := Mux(copyPutMask.andR, putCopyFullBits, putCopyPartialBits)
   val (_, putFlagBits) = edge.Put(2.U, curCompletionAddr, 0.U, flagPutData)
 
   tl.a.valid := false.B
   tl.a.bits := getBits
 
-  when (state === sIssueGet && !srcIssueBlocked && !srcNeedPtwReq) {
+  when ((shouldIssueGet0 || shouldIssueGet1) &&
+      !readResolvedAddr.issueBlocked && !readResolvedAddr.needPtwReq) {
     tl.a.valid := true.B
     tl.a.bits := getBits
-  } .elsewhen (state === sIssuePut && !dstIssueBlocked && !dstNeedPtwReq) {
+  } .elsewhen (state === sIssuePut && !writeResolvedAddr.issueBlocked && !writeResolvedAddr.needPtwReq) {
     tl.a.valid := true.B
     tl.a.bits := putCopyBits
   } .elsewhen (state === sIssueFlag) {
@@ -322,7 +314,7 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
     tl.a.bits := putFlagBits
   }
 
-  tl.d.ready := state === sWaitGet || state === sWaitPut || state === sWaitFlag
+  tl.d.ready := state === sWaitGet0 || state === sWaitGet1 || state === sWaitPut || state === sWaitFlag
 
   when (state === sIdle && copyReqQ.io.deq.valid) {
     copyReqQ.io.deq.ready := true.B
@@ -330,17 +322,42 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
     curDst := copyReqQ.io.deq.bits.dst
     curRemaining := copyReqQ.io.deq.bits.len
     curCompletionAddr := copyReqQ.io.deq.bits.completion
-    state := Mux(copyReqQ.io.deq.bits.len === 0.U, sIssueFlag, sIssueGet)
+    curReadDataLo := 0.U
+    curReadDataHi := 0.U
+    cachedReadValid := false.B
+    state := Mux(copyReqQ.io.deq.bits.len === 0.U, sIssueFlag, sIssueGet0)
   }
 
-  when (state === sIssueGet && tl.a.fire) {
-    curXferBytes := nextXferBytes
-    curLgSize := nextLgSize
-    state := sWaitGet
+  when (state === sIssueGet0) {
+    when (cacheHitLo) {
+      curXferBytes := nextXferBytesWide(curXferBytes.getWidth - 1, 0)
+      curReadDataLo := cachedReadData
+      curReadDataHi := 0.U
+      state := Mux(needSecondRead, sIssueGet1, sIssuePut)
+    } .elsewhen (tl.a.fire) {
+      curXferBytes := nextXferBytesWide(curXferBytes.getWidth - 1, 0)
+      curReadDataHi := 0.U
+      state := sWaitGet0
+    }
   }
 
-  when (state === sWaitGet && tl.d.fire) {
-    curReadData := tl.d.bits.data
+  when (state === sWaitGet0 && tl.d.fire) {
+    curReadDataLo := tl.d.bits.data
+    cachedReadValid := true.B
+    cachedReadBase := curSrcBeatBase
+    cachedReadData := tl.d.bits.data
+    state := Mux(needSecondRead, sIssueGet1, sIssuePut)
+  }
+
+  when (state === sIssueGet1 && tl.a.fire) {
+    state := sWaitGet1
+  }
+
+  when (state === sWaitGet1 && tl.d.fire) {
+    curReadDataHi := tl.d.bits.data
+    cachedReadValid := true.B
+    cachedReadBase := curSrcBeatBase + wideBytes.U
+    cachedReadData := tl.d.bits.data
     state := sIssuePut
   }
 
@@ -354,7 +371,7 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
     curDst := curDst + curXferBytes
     curRemaining := nextRemaining
     effectiveBytes := effectiveBytes + curXferBytes
-    state := Mux(nextRemaining === 0.U, sIssueFlag, sIssueGet)
+    state := Mux(nextRemaining === 0.U, sIssueFlag, sIssueGet0)
   }
 
   when (state === sIssueFlag && tl.a.fire) {
