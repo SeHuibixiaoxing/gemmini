@@ -7,6 +7,7 @@ import org.chipsalliance.cde.config.Parameters
 import freechips.rocketchip.diplomacy.{BundleBridgeSink, IdRange, LazyModule}
 import freechips.rocketchip.tile.{HasCoreParameters, LazyRoCC, LazyRoCCModuleImp, OpcodeSet}
 import freechips.rocketchip.tilelink._
+import midas.targetutils.{PerfCounter, SynthesizePrintf}
 
 case class CoupledDMAParams(
   gemmini_id: Int,
@@ -81,6 +82,19 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
   private val MON_CYCLES = 4.U(64.W)
   private val MON_EFFECTIVE_BYTES = 5.U(64.W)
   private val MON_EFF_BW_X1000_BPC = 6.U(64.W)
+
+  private def ageWhile(active: Bool, width: Int = 32): UInt = {
+    val age = RegInit(0.U(width.W))
+    when (active) {
+      when (!age.andR) { age := age + 1.U }
+    } .otherwise {
+      age := 0.U
+    }
+    age
+  }
+
+  private def debugStuckPrint(age: UInt): Bool =
+    age === 1024.U || (age > 1024.U && age(11, 0) === 0.U)
 
   io.mem.req.valid := false.B
   io.mem.s1_kill := false.B
@@ -281,6 +295,20 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
     spmPtwPendingVpn := spmPtwReqBits.vpn
   }
 
+  when (spmPtwReqValid && spmPtwReqReady) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-ptw-req] pair=%d vpn=%x vaddr=%x pending=%d\n",
+      params.gemmini_id.U, spmPtwReqBits.vpn, spmPtwReqBits.vaddr,
+      spmPtwPendingValid.asUInt))
+  }
+
+  when (spmPtwResp.valid) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-ptw-resp] pair=%d vpn=%x fault=%d pte=%x\n",
+      params.gemmini_id.U, spmPtwResp.bits.vpn,
+      spmPtwResp.bits.accessFault.asUInt, spmPtwResp.bits.pte))
+  }
+
   val srcShiftBits = Cat(curSrcBeatOffset, 0.U(3.W))
   val dstShiftBits = Cat(curDstBeatOffset, 0.U(3.W))
   val readWindow = Cat(curReadDataHi, curReadDataLo)
@@ -437,6 +465,59 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
   val acceptMonitor = io.cmd.fire && isMonitor
   val acceptSfence = io.cmd.fire && isSfence
 
+  val cmdBlockedAge = ageWhile(io.cmd.valid && !io.cmd.ready)
+  when (debugStuckPrint(cmdBlockedAge)) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-cmd-stuck] pair=%d age=%d funct=%d valid=%d ready=%d state=%d dma_busy=%d resp_valid=%d can_resp=%d can_fence=%d q_enq_ready=%d q_deq_valid=%d q_count=%d rs1=%x rs2=%x\n",
+      params.gemmini_id.U, cmdBlockedAge, funct, io.cmd.valid.asUInt,
+      io.cmd.ready.asUInt, state, dmaBusy.asUInt, respValid.asUInt,
+      canAcceptRespCmd.asUInt, canCompleteFence.asUInt,
+      copyReqQ.io.enq.ready.asUInt, copyReqQ.io.deq.valid.asUInt,
+      copyReqQ.io.count, io.cmd.bits.rs1, io.cmd.bits.rs2))
+  }
+
+  val dmaProgress = tl.a.fire || tl.d.fire || copyReqQ.io.deq.fire
+  val dmaStateAge = ageWhile(state =/= sIdle && !dmaProgress)
+  when (debugStuckPrint(dmaStateAge)) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-state-stuck] pair=%d age=%d state=%d tl_a_valid=%d tl_a_ready=%d tl_d_valid=%d tl_d_ready=%d ptw_valid=%d ptw_ready=%d remaining=%x src=%x dst=%x completion=%x\n",
+      params.gemmini_id.U, dmaStateAge, state, tl.a.valid.asUInt,
+      tl.a.ready.asUInt, tl.d.valid.asUInt, tl.d.ready.asUInt,
+      spmPtwReqValid.asUInt, spmPtwReqReady.asUInt, curRemaining,
+      curSrc, curDst, curCompletionAddr))
+  }
+
+  when (acceptDest) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-dst] pair=%d dst=%x completion=%x\n",
+      params.gemmini_id.U, io.cmd.bits.rs1, io.cmd.bits.rs2))
+  }
+
+  when (acceptSrc) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-src] pair=%d src=%x len=%x dst=%x completion=%x q_count=%d\n",
+      params.gemmini_id.U, io.cmd.bits.rs1, io.cmd.bits.rs2,
+      dstAddrReg, completionAddrReg, copyReqQ.io.count))
+  }
+
+  when (acceptFence) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-fence] pair=%d rd=%d state=%d dma_busy=%d resp_valid=%d q_count=%d\n",
+      params.gemmini_id.U, io.cmd.bits.inst.rd, state, dmaBusy.asUInt,
+      respValid.asUInt, copyReqQ.io.count))
+  }
+
+  when (acceptMonitor) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-monitor] pair=%d rd=%d selector=%x data=%x\n",
+      params.gemmini_id.U, io.cmd.bits.inst.rd, io.cmd.bits.rs1, monitorData))
+  }
+
+  when (acceptSfence) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-sfence] pair=%d\n", params.gemmini_id.U))
+  }
+
   when (acceptDest) {
     dstAddrReg := io.cmd.bits.rs1
     completionAddrReg := io.cmd.bits.rs2
@@ -451,6 +532,20 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
     copyReqQ.io.enq.bits.completion := completionAddrReg
     srcCmdCount := srcCmdCount + 1.U
     reqCopyBytes := reqCopyBytes + io.cmd.bits.rs2
+  }
+
+  when (state === sIdle && copyReqQ.io.deq.fire) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-copy-start] pair=%d src=%x dst=%x len=%x completion=%x q_count=%d\n",
+      params.gemmini_id.U, copyReqQ.io.deq.bits.src, copyReqQ.io.deq.bits.dst,
+      copyReqQ.io.deq.bits.len, copyReqQ.io.deq.bits.completion,
+      copyReqQ.io.count))
+  }
+
+  when (state === sWaitFlag && tl.d.fire) {
+    SynthesizePrintf(printf(
+      "[coupled-dma-copy-done] pair=%d effective=%x cycles=%x src_cmds=%x dst_cmds=%x\n",
+      params.gemmini_id.U, effectiveBytes, cycleCount, srcCmdCount, dstCmdCount))
   }
 
   when (acceptFence) {
@@ -470,4 +565,35 @@ class GemminiCoupledDMAImp(outer: GemminiCoupledDMA, params: CoupledDMAParams)(i
   }
 
   io.busy := dmaBusy || respValid
+
+  val debugState = Cat(
+    state,
+    io.cmd.valid,
+    io.cmd.ready,
+    funct,
+    dmaBusy,
+    respValid,
+    canAcceptRespCmd,
+    canCompleteFence,
+    copyReqQ.io.enq.ready,
+    copyReqQ.io.deq.valid,
+    copyReqQ.io.count,
+    tl.a.valid,
+    tl.a.ready,
+    tl.d.valid,
+    tl.d.ready,
+    spmPtwReqValid,
+    spmPtwReqReady,
+    spmPtwPendingValid,
+    curRemaining(15, 0))
+  PerfCounter.identity(debugState, s"coupled_dma_${params.gemmini_id}_state",
+    "CoupledDMA command and FSM state")
+  PerfCounter(acceptSrc.asUInt, s"coupled_dma_${params.gemmini_id}_src_cmd",
+    "CoupledDMA accepted a source command")
+  PerfCounter(acceptFence.asUInt, s"coupled_dma_${params.gemmini_id}_fence_cmd",
+    "CoupledDMA accepted a fence command")
+  PerfCounter(tl.a.fire.asUInt, s"coupled_dma_${params.gemmini_id}_tl_a_fire",
+    "CoupledDMA emitted a TileLink A beat")
+  PerfCounter(tl.d.fire.asUInt, s"coupled_dma_${params.gemmini_id}_tl_d_fire",
+    "CoupledDMA accepted a TileLink D beat")
 }
